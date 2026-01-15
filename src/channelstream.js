@@ -1,5 +1,30 @@
 /**
- * Main Channelstream connection class
+ * @fileoverview Channelstream client library for real-time messaging.
+ *
+ * This module provides a client for connecting to Channelstream servers,
+ * supporting WebSocket connections with automatic long-polling fallback.
+ * Features include:
+ * - Automatic reconnection with exponential backoff (up to 60 seconds)
+ * - Heartbeat mechanism to maintain connection
+ * - Request mutator system for customizing outgoing requests
+ * - Channel subscription management
+ *
+ * @module channelstream
+ */
+
+/**
+ * Main Channelstream connection class.
+ *
+ * Manages the connection lifecycle, channel subscriptions, and message handling
+ * for real-time communication with a Channelstream server.
+ *
+ * @example
+ * const conn = new ChannelStreamConnection();
+ * conn.connectUrl = '/api/connect';
+ * conn.websocketUrl = 'wss://example.com/ws';
+ * conn.username = 'user123';
+ * conn.channels = ['lobby', 'notifications'];
+ * conn.connect();
  */
 export class ChannelStreamConnection {
 
@@ -8,16 +33,23 @@ export class ChannelStreamConnection {
     }
 
     constructor() {
+        // --- Debug settings ---
         this.debug = false;
+
+        // --- User and connection state ---
         /** List of channels user should be subscribed to. */
         this.channels = [];
         /** Username of connecting user. */
         this.username = 'Anonymous';
-        /** Connection identifier. */
+        /** Connection identifier returned by server after connect(). */
         this.connectionId = null;
-        /** Websocket instance. */
+        /** WebSocket instance (null when using long-polling). */
         this.websocket = null;
-        /** Websocket connection url. */
+        /** Whether currently connected to the server. */
+        this.connected = false;
+
+        // --- Endpoint URLs (must be configured before connect()) ---
+        /** WebSocket connection URL (e.g., 'wss://example.com/ws'). */
         this.websocketUrl = '';
         /** URL used in `connect()`. */
         this.connectUrl = '';
@@ -35,25 +67,26 @@ export class ChannelStreamConnection {
         this.messageEditUrl = '';
         /** URL used in `deleteMessage()`. */
         this.messageDeleteUrl = '';
-        /** Long-polling connection url. */
+        /** Long-polling connection URL (fallback when WebSocket unavailable). */
         this.longPollUrl = '';
-        /** Long-polling connection url. */
+
+        // --- Reconnection settings ---
+        /** Whether to automatically reconnect on connection loss. */
         this.shouldReconnect = true;
-        /** Should send heartbeats. */
+        /** Whether to send periodic heartbeats to keep connection alive. */
         this.heartbeats = true;
-        /** How much should every retry interval increase (in milliseconds) */
+        /** Reconnection backoff increment in milliseconds. */
         this.increaseBounceIv = 2000;
+        /** Current reconnection interval (increases with each retry). */
         this._currentBounceIv = 0;
-        /** Should use websockets or long-polling by default */
+        /** Force long-polling instead of WebSocket if true. */
         this.noWebsocket = false;
-        this.connected = false;
 
         /**
-         * Mutators hold functions that you can set locally to change the data
-         * that the client is sending to all endpoints
-         * you can call it like `elem.mutators('connect', yourFunc())`
-         * mutators will be executed in order they were pushed onto arrays
-         *
+         * Mutators are functions that transform request data before sending.
+         * Use addMutator() to register functions for specific request types.
+         * Mutators execute in registration order, allowing request customization
+         * (e.g., adding authentication headers, modifying payloads).
          */
         this.mutators = {
             connect: [],
@@ -259,15 +292,18 @@ export class ChannelStreamConnection {
     }
 
     /**
-     * Opens "long lived" (websocket/longpoll) connection to the channelstream server.
-     * @param request
-     * @param data
+     * Opens a persistent connection (WebSocket or long-poll) to receive messages.
+     * Automatically selects WebSocket if available, falling back to long-polling.
+     * @param request {ChannelStreamRequest} The connect request that triggered this
+     * @param data {object} Server response from connect()
      */
     startListening(request, data) {
         this.beforeListeningCallback(request, data);
+        // Check WebSocket availability if not explicitly disabled
         if (this.noWebsocket === false) {
             this.noWebsocket = !window.WebSocket;
         }
+        // Use WebSocket when available, otherwise fall back to long-polling
         if (this.noWebsocket === false) {
             this.openWebsocket();
         } else {
@@ -288,12 +324,13 @@ export class ChannelStreamConnection {
     }
 
     /**
-     * Opens websocket connection.
-     *
+     * Opens WebSocket connection and binds event handlers.
+     * Connection ID is passed as query parameter for server-side session matching.
      */
     openWebsocket() {
         let url = this.websocketUrl + '?conn_id=' + this.connectionId;
         this.websocket = new WebSocket(url);
+        // Bind all WebSocket events to internal handlers
         this.websocket.onopen = this._handleListenOpen.bind(this);
         this.websocket.onclose = this._handleWebsocketCloseEvent.bind(this);
         this.websocket.onerror = this._handleListenErrorEvent.bind(this);
@@ -301,50 +338,59 @@ export class ChannelStreamConnection {
     }
 
     /**
-     * Opens long-poll connection.
-     *
+     * Opens long-poll connection as fallback when WebSocket is unavailable.
+     * Long-polling works by making repeated HTTP requests - each request blocks
+     * until the server has data or times out, then immediately reconnects.
      */
     openLongPoll() {
         let request = new ChannelStreamRequest();
         request.url = this.longPollUrl + '?conn_id=' + this.connectionId;
         request.handleError = this._handleListenErrorEvent.bind(this);
+        // Mark connected when request starts (server accepted connection)
         request.handleRequest = function () {
             this.connected = true;
             this.listenOpenedCallback(request);
         }.bind(this);
+        // On response, process messages and immediately start next poll
         request.handleResponse = function (request, data) {
             this._handleListenMessageEvent(data);
         }.bind(this);
         request.execute();
+        // Store reference to allow aborting the request on disconnect
         this._ajaxListen = request;
     }
 
     /**
-     * Retries `connect()` call while incrementing interval between tries up to 1 minute.
-     *
+     * Retries connect() using exponential backoff strategy.
+     * Each retry waits longer (by increaseBounceIv ms) up to a maximum of 60 seconds.
+     * This prevents overwhelming the server during outages.
      */
     retryConnection() {
         if (!this.shouldReconnect) {
             return;
         }
+        // Exponential backoff: increase interval each retry, cap at 60 seconds
         if (this._currentBounceIv < 60000) {
             this._currentBounceIv = this._currentBounceIv + this.increaseBounceIv;
         } else {
             this._currentBounceIv = 60000;
         }
+        // Schedule reconnection attempt after the backoff interval
         setTimeout(this.connect.bind(this), this._currentBounceIv);
     }
 
     /**
-     * Closes currently listening connection.
-     *
+     * Closes the current listening connection (WebSocket or long-poll).
+     * Cleans up event handlers to prevent reconnection triggers.
      */
     closeConnection() {
+        // Close WebSocket if open, removing handlers to prevent reconnect loop
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
             this.websocket.onclose = null;
             this.websocket.onerror = null;
             this.websocket.close();
         }
+        // Abort any pending long-poll request
         if (this._ajaxListen) {
             let request = this._ajaxListen.request;
             request.abort();
@@ -398,14 +444,20 @@ export class ChannelStreamConnection {
     }
 
     /**
-     * Starts sending heartbeats to maintain connection and notify server
+     * Starts periodic heartbeat messages to keep the connection alive.
+     * Heartbeats prevent server-side timeout and help detect dead connections.
      */
     createHeartBeats() {
+        // Only create heartbeat interval once, and only for WebSocket connections
         if (typeof this._heartbeat === 'undefined' && this.websocket !== null && this.heartbeats) {
             this._heartbeat = setInterval(this._sendHeartBeat.bind(this), 10000);
         }
     }
 
+    /**
+     * Sends a single heartbeat message over the WebSocket.
+     * @private
+     */
     _sendHeartBeat() {
         if (this.websocket.readyState === WebSocket.OPEN && this.heartbeats) {
             this.websocket.send(JSON.stringify({type: 'heartbeat'}));
@@ -448,11 +500,14 @@ export class ChannelStreamConnection {
     }
 
     /**
-     * Handles long-polling payloads
-     * @param data
+     * Handles long-polling payloads and re-initiates the poll loop.
+     * Uses setTimeout(0) to allow the current call stack to complete
+     * before starting the next long-poll request.
+     * @param data {object} Parsed JSON response from server
      * @private
      */
     _handleListenMessageEvent(data) {
+        // Immediately schedule next poll (async to prevent stack overflow)
         setTimeout(this.openLongPoll.bind(this), 0);
         this.listenMessageCallback(data);
     }
@@ -526,17 +581,21 @@ export class ChannelStreamConnection {
     }
 
     /**
-     *
-     * @param request
-     * @param data
+     * Handles successful connection response from server.
+     * Stores connection ID, updates channels, and starts listening for messages.
+     * @param request {ChannelStreamRequest} The connect request
+     * @param data {object} Server response containing conn_id and channels
      * @private
      */
     _handleConnect(request, data) {
+        // Reset reconnection backoff on successful connect
         this.currentBounceIv = 0;
+        // Store server-assigned connection ID for subsequent requests
         this.connectionId = data.conn_id;
         this.channels = data.channels;
         this.channelsChangedCallback(this.channels);
         this.connectCallback(request, data);
+        // Begin listening for real-time messages
         this.startListening(request, data);
     }
 
@@ -845,14 +904,23 @@ export class ChannelStreamConnection {
 };
 
 /**
- * Base class for making ajax requests
+ * Internal helper class for making AJAX requests with JSON payloads.
+ * Provides a consistent interface for HTTP operations with customizable
+ * response/error handlers. Used internally by ChannelStreamConnection.
+ *
+ * @class ChannelStreamRequest
+ * @private
  */
 class ChannelStreamRequest {
 
     constructor() {
+        /** Custom headers to send with the request. */
         this.headers = [];
+        /** Request body (will be JSON-serialized if present). */
         this.body = null;
+        /** Target URL for the request. */
         this.url = '';
+        /** XMLHttpRequest instance (populated after execute()). */
         this.request = null;
     }
 
@@ -877,43 +945,56 @@ class ChannelStreamRequest {
     };
 
     /**
-     * Placeholder for in-progress requests
-     * @param request
+     * Placeholder for in-progress request handler.
+     * Override to track request progress (e.g., for long-poll connections).
+     * @param request {XMLHttpRequest} The in-progress request
      */
     handleRequest(request) {
     };
 
+    /**
+     * XMLHttpRequest state change handler.
+     * Routes to appropriate callback based on request state and status code.
+     */
     handleStateChange() {
         let result = this.request.responseText;
+        // Attempt to parse response as JSON (gracefully handles non-JSON)
         try {
             result = JSON.parse(result);
         } catch (exc) {
-
+            // Keep raw text if not valid JSON
         }
+        // DONE state means request completed (success or failure)
         if (this.request.readyState === XMLHttpRequest.DONE) {
+            // Status 1-399 = success, 400+ or 0 = error
             if (this.request.status && this.request.status <= 400) {
                 this.handleResponse(this.request, result);
             } else {
                 this.handleError(this.request, result);
             }
         } else {
+            // Request still in progress (OPENED, HEADERS_RECEIVED, LOADING)
             this.handleRequest(this.request);
         }
     };
 
     /**
-     * Execute AJAX request using specific verb, can send JSON payloads
-     * @param verb {string} HTTP verb
+     * Executes the AJAX request with the specified HTTP verb.
+     * Automatically JSON-serializes body if present, defaults to POST with body or GET without.
+     * @param verb {string} HTTP verb (GET, POST, PATCH, DELETE, etc.)
      */
     execute(verb) {
         this.request = new XMLHttpRequest();
         this.request.onreadystatechange = this.handleStateChange.bind(this);
+        // Apply any custom headers
         if (this.headers) {
             for (let i = 0; i < this.headers.length; i++) {
                 this.request.setRequestHeader(
                     this.headers[i].name, this.headers[i].value);
             }
         }
+        // With body: default to POST, serialize as JSON
+        // Without body: default to GET
         if (this.body) {
             this.request.open(verb || 'POST', this.url);
             this.request.setRequestHeader('Content-Type', 'application/json');

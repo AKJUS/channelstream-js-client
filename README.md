@@ -48,6 +48,57 @@ connection.connect();
 
 Consult the project website for more in depth examples.
 
+## Development
+
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/Channelstream/channelstream-js-client.git
+cd channelstream-js-client
+npm install
+```
+
+## Build
+
+Build the ES modules using Rollup:
+
+```bash
+npm run build
+```
+
+This converts the CommonJS SHA modules to ES modules (`sha-esm.js`, `sha1-esm.js`).
+
+Note: The build runs automatically on `npm install` via the `prepare` script.
+
+## Documentation
+
+Generate API documentation with JSDoc:
+
+```bash
+npm run jsdoc
+```
+
+Documentation is output to the `jsdoc_out/` directory.
+
+## Publishing to npm
+
+1. **Remove private flag**: Edit `package.json` and set `"private": false` or remove the field entirely.
+
+2. **Update version**: Bump the version in `package.json`:
+   ```bash
+   npm version patch  # or minor/major
+   ```
+
+3. **Login to npm**:
+   ```bash
+   npm login
+   ```
+
+4. **Publish** (scoped packages require `--access public`):
+   ```bash
+   npm publish --access public
+   ```
+
 ## License
 
 BSD 3-Clause License
